@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS message_headers (
     raw_value       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_headers_name_value ON message_headers(name, value);
+CREATE INDEX IF NOT EXISTS idx_headers_message ON message_headers(message_id);
 
 CREATE TABLE IF NOT EXISTS message_identifiers (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

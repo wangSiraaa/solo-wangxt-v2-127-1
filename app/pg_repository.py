@@ -11,9 +11,42 @@ from psycopg.types.json import Jsonb
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import SearchFilters
 from app.threads import ThreadInput, compute_threads
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
+
+# Shared WHERE fragment for the combined search. Static SQL only — every
+# user-supplied value arrives through a %(name)s parameter, and the keyword
+# pattern is LIKE-escaped so `%`/`_` stay literal (matching the memory
+# backend's substring semantics). The `::type` casts on the IS NULL checks
+# pin the parameter types: psycopg sends each placeholder occurrence with an
+# unknown type, and `IS NULL` alone gives the server nothing to infer from.
+_SEARCH_WHERE = """
+    (%(q)s::text IS NULL
+     OR m.subject ILIKE %(like)s ESCAPE '\\'
+     OR m.message_id ILIKE %(like)s ESCAPE '\\'
+     OR EXISTS (SELECT 1 FROM message_headers h
+                WHERE h.message_id = m.id AND h.value ILIKE %(like)s ESCAPE '\\')
+     OR EXISTS (SELECT 1 FROM bodies b
+                WHERE b.message_pk = m.id AND b.plain_text ILIKE %(like)s ESCAPE '\\'))
+    AND (%(from_addr)s::text IS NULL OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(m.from_json) AS fa
+        WHERE lower(fa ->> 'address') = %(from_addr)s))
+    AND (%(to_addr)s::text IS NULL OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(m.to_json) AS ta
+        WHERE lower(ta ->> 'address') = %(to_addr)s))
+    AND (%(date_from)s::timestamptz IS NULL OR m.date >= %(date_from)s)
+    AND (%(date_to)s::timestamptz IS NULL OR m.date <= %(date_to)s)
+    AND (%(has_att)s::boolean IS NULL OR %(has_att)s = (EXISTS (
+        SELECT 1 FROM attachments a WHERE a.message_pk = m.id)))
+    AND (%(status)s::text IS NULL OR i.status = %(status)s)
+"""
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE metacharacters so the keyword stays a literal substring."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _dt(value: datetime | None):
@@ -282,28 +315,47 @@ class PgRepository:
             cols = [c.name for c in cur.description]
             return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
 
-    def search_messages(self, query: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        like = f"%{query}%"
+    def search_messages(self, filters: SearchFilters) -> dict[str, Any]:
+        params = {
+            "q": filters.q,
+            "like": f"%{_like_escape(filters.q)}%" if filters.q is not None else None,
+            "from_addr": filters.from_address,
+            "to_addr": filters.to_address,
+            "date_from": _dt(filters.date_from),
+            "date_to": _dt(filters.date_to),
+            "has_att": filters.has_attachment,
+            "status": filters.status,
+            "limit": filters.limit,
+            "offset": filters.offset,
+        }
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT DISTINCT m.id, m.message_id, m.subject, m.date, m.from_json,
+                f"SELECT COUNT(*) FROM messages m JOIN ingests i ON i.id = m.ingest_id"
+                f" WHERE {_SEARCH_WHERE}",
+                params,
+            )
+            total = cur.fetchone()[0]
+            cur.execute(
+                f"""
+                SELECT m.id, m.message_id, m.subject, m.date, m.from_json,
                        m.thread_key, m.raw_sha256, m.missing_id, m.ingest_id
-                FROM messages m
-                LEFT JOIN message_headers h ON h.message_id = m.id
-                LEFT JOIN bodies b ON b.message_pk = m.id
-                WHERE m.subject ILIKE %s
-                   OR m.message_id ILIKE %s
-                   OR h.value ILIKE %s
-                   OR b.plain_text ILIKE %s
-                ORDER BY m.date DESC NULLS LAST
-                LIMIT %s OFFSET %s
+                FROM messages m JOIN ingests i ON i.id = m.ingest_id
+                WHERE {_SEARCH_WHERE}
+                ORDER BY m.date DESC NULLS LAST, m.id DESC
+                LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                (like, like, like, like, limit, offset),
+                params,
             )
             cols = [c.name for c in cur.description]
             items = _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
-        return {"query": query, "count": len(items), "results": items}
+        return {
+            "query": filters.q,
+            "filters": filters.applied(),
+            "count": total,
+            "limit": filters.limit,
+            "offset": filters.offset,
+            "results": items,
+        }
 
     def get_thread(self, thread_key: str) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:

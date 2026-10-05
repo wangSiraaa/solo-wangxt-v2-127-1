@@ -56,7 +56,37 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
 | GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
-| GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
+| GET | `/search` | combined search: keyword `q` plus composable filters (`from`, `to`, `date_from`, `date_to`, `has_attachment`, `status`); returns total hit count and the applied filters |
+
+### Combined search filters
+
+`GET /search` accepts any combination of the following (all AND-ed; every
+parameter is optional):
+
+| Parameter | Semantics |
+|---|---|
+| `q` | case-insensitive literal substring over subject, Message-ID, all header values and body plain text (`%`/`_` are literal, not LIKE wildcards) |
+| `from` / `to` | exact address match against the **parsed** `From:` / `To:` headers. Both sides are normalized (display name stripped, addr-spec lower-cased), so `Alice <Alice@Example.COM>` matches `alice@example.com`. Detail responses still carry the original display name and raw header |
+| `date_from` / `date_to` | inclusive ISO-8601 bounds on the parsed `Date` header. Messages **without** a parsed date never match a bounded range — missing dates are not fabricated |
+| `has_attachment` | `true` keeps only messages with at least one attachment part, `false` only those without |
+| `status` | parse status of the message's ingest: `ok` / `defective` / `failed` (`failed` ingests have no message row, so they are listed via `/failures`, not `/search`) |
+
+The response echoes the active criteria in normalized form and reports the
+**total** hit count independently of pagination:
+
+```json
+GET /search?q=Quarterly&from=q@example.com&status=ok&limit=20&offset=0
+{
+  "query": "Quarterly",
+  "filters": {"q": "Quarterly", "from": "q@example.com", "status": "ok"},
+  "count": 1, "limit": 20, "offset": 0,
+  "results": [ ... message summaries ... ]
+}
+```
+
+The in-memory and PostgreSQL repositories implement identical semantics
+(shared `SearchFilters` normalization in `app/repository.py`; parity tests in
+`tests/test_pg_integration.py`).
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
@@ -101,6 +131,7 @@ EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/t
 ```bash
 curl -F "file=@samples/01_multibyte.eml" http://127.0.0.1:8080/ingest
 curl "http://127.0.0.1:8080/search?q=GB18030"
+curl "http://127.0.0.1:8080/search?from=sigs@example.com&has_attachment=true&status=ok"
 ```
 
 ## Layout

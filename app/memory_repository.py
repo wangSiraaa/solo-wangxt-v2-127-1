@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.repository import SearchFilters, normalize_address
 from app.threads import ThreadInput, compute_threads
 
 
@@ -229,10 +230,12 @@ class MemoryRepository:
         ordered = sorted(self.messages.values(), key=lambda x: x["id"], reverse=True)
         return [self._summary(m) for m in ordered[offset : offset + limit]]
 
-    def search_messages(self, query: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        q = query.lower()
+    def search_messages(self, filters: SearchFilters) -> dict[str, Any]:
+        q = filters.q.lower() if filters.q else None
 
-        def match(m: dict[str, Any]) -> bool:
+        def keyword_match(m: dict[str, Any]) -> bool:
+            if q is None:
+                return True
             if (m["subject"] or "").lower().find(q) >= 0:
                 return True
             if (m["message_id"] or "").lower().find(q) >= 0:
@@ -245,8 +248,53 @@ class MemoryRepository:
                     return True
             return False
 
-        hits = [self._summary(m) for m in self.messages.values() if match(m)]
-        return {"query": query, "count": len(hits), "results": hits[offset : offset + limit]}
+        def match(m: dict[str, Any]) -> bool:
+            if not keyword_match(m):
+                return False
+            if filters.from_address is not None:
+                senders = {normalize_address(a.get("address")) for a in m["from_json"]}
+                if filters.from_address not in senders:
+                    return False
+            if filters.to_address is not None:
+                recipients = {normalize_address(a.get("address")) for a in m["to_json"]}
+                if filters.to_address not in recipients:
+                    return False
+            # A missing Date is never fabricated: undated messages fall out of
+            # any bounded range.
+            if filters.date_from is not None:
+                if m["date"] is None or m["date"] < filters.date_from:
+                    return False
+            if filters.date_to is not None:
+                if m["date"] is None or m["date"] > filters.date_to:
+                    return False
+            if filters.has_attachment is not None:
+                has = any(a["message_pk"] == m["id"] for a in self.attachments)
+                if has != filters.has_attachment:
+                    return False
+            if filters.status is not None:
+                ingest = self.ingests.get(m["ingest_id"])
+                if ingest is None or ingest["status"] != filters.status:
+                    return False
+            return True
+
+        hits = [m for m in self.messages.values() if match(m)]
+        # Same ordering as the PostgreSQL backend: date DESC NULLS LAST, id DESC.
+        hits.sort(
+            key=lambda m: (
+                m["date"] is None,
+                -(m["date"].timestamp() if m["date"] else 0.0),
+                -m["id"],
+            )
+        )
+        page = hits[filters.offset : filters.offset + filters.limit]
+        return {
+            "query": filters.q,
+            "filters": filters.applied(),
+            "count": len(hits),
+            "limit": filters.limit,
+            "offset": filters.offset,
+            "results": [self._summary(m) for m in page],
+        }
 
     def get_thread(self, thread_key: str) -> dict[str, Any] | None:
         msgs = [m for m in self.messages.values() if m["thread_key"] == thread_key]

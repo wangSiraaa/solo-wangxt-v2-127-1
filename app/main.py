@@ -6,7 +6,8 @@ its size is bounded by an explicit streaming cap.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, Response
@@ -14,7 +15,7 @@ from fastapi.responses import FileResponse, Response
 from app.config import Settings, get_settings
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
-from app.repository import Repository
+from app.repository import Repository, SearchFilters
 from app.schemas import (
     FailureOut,
     Health,
@@ -140,11 +141,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/search", response_model=SearchResponse, tags=["messages"])
     def search(
         request: Request,
-        q: str = Query(..., min_length=1, description="substring over subject/ids/headers/plain text"),
+        q: str | None = Query(
+            None, min_length=1,
+            description="substring over subject/ids/headers/plain text",
+        ),
+        from_address: str | None = Query(
+            None, alias="from",
+            description="exact sender address; normalized (case/display-name insensitive)",
+        ),
+        to_address: str | None = Query(
+            None, alias="to",
+            description="exact recipient address; normalized (case/display-name insensitive)",
+        ),
+        date_from: datetime | None = Query(
+            None, description="inclusive lower bound on the parsed Date header (ISO 8601)",
+        ),
+        date_to: datetime | None = Query(
+            None, description="inclusive upper bound on the parsed Date header (ISO 8601)",
+        ),
+        has_attachment: bool | None = Query(
+            None, description="keep only messages with (true) or without (false) attachment parts",
+        ),
+        status: Literal["ok", "defective", "failed"] | None = Query(
+            None, description="parse status of the message's ingest",
+        ),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> dict[str, Any]:
-        return get_state(request).repo.search_messages(q, limit, offset)
+        filters = SearchFilters(
+            q=q,
+            from_address=from_address,
+            to_address=to_address,
+            date_from=date_from,
+            date_to=date_to,
+            has_attachment=has_attachment,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        return get_state(request).repo.search_messages(filters)
 
     # ---- ingests / failures ---------------------------------------------
     @app.get("/ingests/{ingest_id}", response_model=IngestDetail, tags=["ingest"])
