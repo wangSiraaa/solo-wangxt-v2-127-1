@@ -15,8 +15,8 @@ from app.config import Settings, get_settings
 from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
-from app.schemas import (
-    FailureOut,
+from app.search_filters import parse_search_filters
+from app.schemas import (    FailureOut,
     Health,
     IngestDetail,
     IngestResponse,
@@ -140,11 +140,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/search", response_model=SearchResponse, tags=["messages"])
     def search(
         request: Request,
-        q: str = Query(..., min_length=1, description="substring over subject/ids/headers/plain text"),
+        q: str | None = Query(
+            None, min_length=1,
+            description="substring over subject/ids/headers/plain text",
+        ),
+        from_addr: str | None = Query(
+            None, alias="from",
+            description="sender mailbox, normalized exact match (case-insensitive)",
+        ),
+        to_addr: str | None = Query(
+            None, alias="to",
+            description="recipient mailbox (To/Cc/Bcc), normalized exact match",
+        ),
+        date_from: str | None = Query(
+            None, description="inclusive lower Date bound, ISO 8601 (naive = UTC)",
+        ),
+        date_to: str | None = Query(
+            None, description="inclusive upper Date bound; date-only means end of day UTC",
+        ),
+        has_attachment: bool | None = Query(None, description="only messages with/without attachments"),
+        parse_status: str | None = Query(
+            None, alias="status", description="parse status: ok | defective | failed",
+        ),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> dict[str, Any]:
-        return get_state(request).repo.search_messages(q, limit, offset)
+        try:
+            filters = parse_search_filters(
+                q=q,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                date_from=date_from,
+                date_to=date_to,
+                has_attachment=has_attachment,
+                status=parse_status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return get_state(request).repo.search_messages(filters, limit, offset)
 
     # ---- ingests / failures ---------------------------------------------
     @app.get("/ingests/{ingest_id}", response_model=IngestDetail, tags=["ingest"])

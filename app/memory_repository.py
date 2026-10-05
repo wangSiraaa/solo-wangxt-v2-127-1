@@ -11,7 +11,15 @@ from typing import Any, Sequence
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.search_filters import SearchFilters, normalize_address
 from app.threads import ThreadInput, compute_threads
+
+_MIN_DT = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _aware(value: datetime) -> datetime:
+    """Defensive: stored dates are tz-aware; read naive ones as UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _addr_json(addrs) -> list[dict[str, Any]]:
@@ -229,24 +237,75 @@ class MemoryRepository:
         ordered = sorted(self.messages.values(), key=lambda x: x["id"], reverse=True)
         return [self._summary(m) for m in ordered[offset : offset + limit]]
 
-    def search_messages(self, query: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        q = query.lower()
+    def search_messages(self, filters: SearchFilters, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        hits = [m for m in self.messages.values() if self._matches(m, filters)]
+        # Same ordering as the PostgreSQL backend: date DESC NULLS LAST, id DESC.
+        hits.sort(key=lambda m: (m["date"] is not None, m["date"] or _MIN_DT, m["id"]), reverse=True)
+        page = hits[offset : offset + limit]
+        return {
+            "query": filters.q,
+            "count": len(hits),
+            "limit": limit,
+            "offset": offset,
+            "filters": filters.describe(),
+            "results": [self._search_summary(m) for m in page],
+        }
 
-        def match(m: dict[str, Any]) -> bool:
-            if (m["subject"] or "").lower().find(q) >= 0:
+    def _search_summary(self, m: dict[str, Any]) -> dict[str, Any]:
+        row = self._summary(m)
+        row["has_attachment"] = self._has_attachment(m["id"])
+        row["status"] = self._status_of(m)
+        return row
+
+    def _has_attachment(self, message_pk: int) -> bool:
+        return any(a["message_pk"] == message_pk for a in self.attachments)
+
+    def _status_of(self, m: dict[str, Any]) -> str | None:
+        ing = self.ingests.get(m["ingest_id"])
+        return ing["status"] if ing else None
+
+    def _keyword_match(self, m: dict[str, Any], q: str) -> bool:
+        if (m["subject"] or "").lower().find(q) >= 0:
+            return True
+        if (m["message_id"] or "").lower().find(q) >= 0:
+            return True
+        for h in self.headers:
+            if h["message_id"] == m["id"] and h["value"].lower().find(q) >= 0:
                 return True
-            if (m["message_id"] or "").lower().find(q) >= 0:
+        for b in self.bodies:
+            if b["message_pk"] == m["id"] and (b.get("plain_text") or "").lower().find(q) >= 0:
                 return True
-            for h in self.headers:
-                if h["message_id"] == m["id"] and h["value"].lower().find(q) >= 0:
-                    return True
-            for b in self.bodies:
-                if b["message_pk"] == m["id"] and (b.get("plain_text") or "").lower().find(q) >= 0:
-                    return True
+        return False
+
+    def _matches(self, m: dict[str, Any], f: SearchFilters) -> bool:
+        if f.q is not None and not self._keyword_match(m, f.q.lower()):
             return False
-
-        hits = [self._summary(m) for m in self.messages.values() if match(m)]
-        return {"query": query, "count": len(hits), "results": hits[offset : offset + limit]}
+        if f.from_addr is not None:
+            senders = {normalize_address(a["address"]) for a in m["from_json"]}
+            if f.from_addr not in senders:
+                return False
+        if f.to_addr is not None:
+            recipients = {
+                normalize_address(a["address"])
+                for a in (m["to_json"] + m["cc_json"] + m["bcc_json"])
+            }
+            if f.to_addr not in recipients:
+                return False
+        if f.date_from is not None or f.date_to is not None:
+            d = m["date"]
+            if d is None:
+                # Undated mail never matches a range: no date is fabricated.
+                return False
+            d = _aware(d)
+            if f.date_from is not None and d < f.date_from:
+                return False
+            if f.date_to is not None and d > f.date_to:
+                return False
+        if f.has_attachment is not None and self._has_attachment(m["id"]) != f.has_attachment:
+            return False
+        if f.status is not None and self._status_of(m) != f.status:
+            return False
+        return True
 
     def get_thread(self, thread_key: str) -> dict[str, Any] | None:
         msgs = [m for m in self.messages.values() if m["thread_key"] == thread_key]

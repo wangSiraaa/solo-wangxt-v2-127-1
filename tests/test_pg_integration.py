@@ -7,6 +7,14 @@ equivalent (JSONB aggregates, LATERAL identifier rollups, ILIKE joins).
 import pytest
 
 from conftest import SAMPLES
+from test_search import (
+    scenario_attachment_defective_crosscheck,
+    scenario_from_disambiguates_same_subject,
+    scenario_like_metacharacters_are_literal,
+    scenario_to_filter_and_date_bounds,
+    scenario_total_count_across_pages,
+    scenario_undated_never_matches_date_range,
+)
 
 pytestmark = pytest.mark.pg
 
@@ -96,3 +104,31 @@ def test_idempotent_schema_init(pg_client):
     # creating a second repository over the same DSN must not error on DDL
     arch.repo.init_schema()
     assert c.get("/health").status_code == 200
+
+
+# -- combined-filter parity with the in-memory backend -----------------------
+# Each scenario runs in its own schema (pg_client is function-scoped), exactly
+# as the memory tests run in a fresh repository.
+
+def test_pg_from_disambiguates_same_subject(pg_client):
+    scenario_from_disambiguates_same_subject(pg_client[0])
+
+
+def test_pg_undated_never_matches_date_range(pg_client):
+    scenario_undated_never_matches_date_range(pg_client[0])
+
+
+def test_pg_attachment_defective_crosscheck(pg_client):
+    scenario_attachment_defective_crosscheck(pg_client[0])
+
+
+def test_pg_total_count_across_pages(pg_client):
+    scenario_total_count_across_pages(pg_client[0])
+
+
+def test_pg_like_metacharacters_are_literal(pg_client):
+    scenario_like_metacharacters_are_literal(pg_client[0])
+
+
+def test_pg_to_filter_and_date_bounds(pg_client):
+    scenario_to_filter_and_date_bounds(pg_client[0])

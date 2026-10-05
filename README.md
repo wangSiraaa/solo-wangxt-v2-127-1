@@ -49,6 +49,43 @@ Implemented in `app/threads.py` (pure function, unit tested):
 * Reference cycles are detected with bounded three-color DFS (`cycles`);
   dangling references (`dangling_references`) are reported, not hidden.
 
+## Search filters
+
+`GET /search` accepts any combination of the following (at least one is
+required; all are ANDed):
+
+| Param | Semantics |
+|---|---|
+| `q` | case-insensitive substring over subject, Message-ID, all header values, body plain text (`%`/`_` are literal) |
+| `from` | sender mailbox, normalized (`strip` + lowercase) exact match against the parsed `From` addresses |
+| `to` | recipient mailbox, normalized exact match against `To`/`Cc`/`Bcc` |
+| `date_from` / `date_to` | inclusive ISO 8601 bounds; naive values are UTC, a date-only upper bound covers the whole day. Messages **without** a `Date` never match a range — no date is fabricated |
+| `has_attachment` | `true` / `false` — parsed attachment parts exist |
+| `status` | parse status `ok` / `defective` / `failed` (from the ingest row; `failed` ingests have no message, so they appear under `/failures`, not here) |
+
+Address matching compares only the normalized mailbox parsed out of the
+header; the stored detail keeps the original display name, raw header text
+and defects untouched.
+
+The response is paged and self-explanatory:
+
+```json
+{
+  "query": "Quarterly",
+  "count": 137,                       // total hits, independent of limit/offset
+  "limit": 50, "offset": 0,
+  "filters": {"q": "Quarterly", "from": "q@example.com",
+              "date_to": "2026-09-29T23:59:59.999999+00:00"},
+  "results": [ {"id": 2, ..., "has_attachment": false, "status": "ok"} ]
+}
+```
+
+`filters` echoes the normalized conditions actually applied, and each result
+row carries `has_attachment` / `status` so hits can be cross-checked against
+`GET /messages/{id}` (attachments, defects) and `GET /ingests/{id}` (status).
+The in-memory and PostgreSQL repositories implement identical semantics —
+the same scenario tests run against both backends.
+
 ## API
 
 | Method | Path | Purpose |
@@ -56,7 +93,7 @@ Implemented in `app/threads.py` (pure function, unit tested):
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
 | GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
-| GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
+| GET | `/search` | combined-filter search: keyword `q` plus `from` / `to` / `date_from` / `date_to` / `has_attachment` / `status` (see below) |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
 | GET | `/ingests/{id}` | provenance: raw digest/path + every defect located by stage |
@@ -91,9 +128,9 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # 58 unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
-  .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
+  .venv/bin/python -m pytest                     # + 12 real PostgreSQL integration tests
 ```
 
 ### Quick manual check
@@ -101,6 +138,7 @@ EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/t
 ```bash
 curl -F "file=@samples/01_multibyte.eml" http://127.0.0.1:8080/ingest
 curl "http://127.0.0.1:8080/search?q=GB18030"
+curl "http://127.0.0.1:8080/search?from=sigs@example.com&has_attachment=true&date_to=2026-10-01"
 ```
 
 ## Layout
@@ -114,6 +152,7 @@ app/
     models.py          structured result dataclasses
   storage.py           ControlledStorage (path safety, 0600, metadata logs)
   threads.py           Message-ID graph + cycles + conflicts + weak subjects
+  search_filters.py    combined search filters: validation + normalization
   pg_repository.py     PostgreSQL persistence (psycopg3)
   memory_repository.py same interface, in-memory (tests / demo)
   service.py           parse -> store -> persist -> thread orchestration

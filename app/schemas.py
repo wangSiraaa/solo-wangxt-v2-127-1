@@ -105,8 +105,14 @@ class MessageDetail(MessageSummary):
 
 
 class SearchResponse(BaseModel):
-    query: str
-    count: int
+    query: str | None
+    count: int = Field(description="total hits across all pages")
+    limit: int
+    offset: int
+    filters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="normalized echo of the applied filter conditions",
+    )
     results: list[dict[str, Any]]
 
 

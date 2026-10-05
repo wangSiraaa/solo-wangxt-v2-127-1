@@ -11,9 +11,15 @@ from psycopg.types.json import Jsonb
 
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
+from app.search_filters import SearchFilters
 from app.threads import ThreadInput, compute_threads
 
 _SCHEMA_PATH = Path(__file__).parent / "sql" / "schema.sql"
+
+
+def _escape_like(value: str) -> str:
+    """Make a keyword literal for LIKE/ILIKE (paired with ``ESCAPE '\\'``)."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _dt(value: datetime | None):
@@ -282,28 +288,72 @@ class PgRepository:
             cols = [c.name for c in cur.description]
             return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
 
-    def search_messages(self, query: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        like = f"%{query}%"
+    def search_messages(self, filters: SearchFilters, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        where: list[str] = []
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if filters.q is not None:
+            params["like"] = f"%{_escape_like(filters.q)}%"
+            where.append(
+                "(m.subject ILIKE %(like)s ESCAPE '\\'"
+                " OR m.message_id ILIKE %(like)s ESCAPE '\\'"
+                " OR EXISTS (SELECT 1 FROM message_headers h"
+                "            WHERE h.message_id = m.id AND h.value ILIKE %(like)s ESCAPE '\\')"
+                " OR EXISTS (SELECT 1 FROM bodies b"
+                "            WHERE b.message_pk = m.id AND b.plain_text ILIKE %(like)s ESCAPE '\\'))"
+            )
+        if filters.from_addr is not None:
+            params["from_addr"] = filters.from_addr
+            where.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements(m.from_json) ea"
+                " WHERE lower(ea.value->>'address') = %(from_addr)s)"
+            )
+        if filters.to_addr is not None:
+            params["to_addr"] = filters.to_addr
+            where.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements(m.to_json || m.cc_json || m.bcc_json) ea"
+                " WHERE lower(ea.value->>'address') = %(to_addr)s)"
+            )
+        if filters.date_from is not None:
+            # NULL dates never satisfy a range predicate: no fabricated dates.
+            params["date_from"] = filters.date_from
+            where.append("m.date >= %(date_from)s")
+        if filters.date_to is not None:
+            params["date_to"] = filters.date_to
+            where.append("m.date <= %(date_to)s")
+        if filters.has_attachment is not None:
+            params["has_attachment"] = filters.has_attachment
+            where.append(
+                "EXISTS (SELECT 1 FROM attachments a WHERE a.message_pk = m.id)"
+                " = %(has_attachment)s"
+            )
+        if filters.status is not None:
+            params["status"] = filters.status
+            where.append("i.status = %(status)s")
+        where_sql = " AND ".join(where) if where else "TRUE"
+        base = f"FROM messages m JOIN ingests i ON i.id = m.ingest_id WHERE {where_sql}"
         with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) {base}", params)
+            total = cur.fetchone()[0]
             cur.execute(
-                """
-                SELECT DISTINCT m.id, m.message_id, m.subject, m.date, m.from_json,
-                       m.thread_key, m.raw_sha256, m.missing_id, m.ingest_id
-                FROM messages m
-                LEFT JOIN message_headers h ON h.message_id = m.id
-                LEFT JOIN bodies b ON b.message_pk = m.id
-                WHERE m.subject ILIKE %s
-                   OR m.message_id ILIKE %s
-                   OR h.value ILIKE %s
-                   OR b.plain_text ILIKE %s
-                ORDER BY m.date DESC NULLS LAST
-                LIMIT %s OFFSET %s
-                """,
-                (like, like, like, like, limit, offset),
+                "SELECT m.id, m.message_id, m.subject, m.date, m.from_json, m.thread_key,"
+                " m.raw_sha256, m.missing_id, m.ingest_id, i.status,"
+                " EXISTS (SELECT 1 FROM attachments a WHERE a.message_pk = m.id)"
+                "   AS has_attachment "
+                + base
+                + " ORDER BY m.date DESC NULLS LAST, m.id DESC"
+                  " LIMIT %(limit)s OFFSET %(offset)s",
+                params,
             )
             cols = [c.name for c in cur.description]
             items = _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
-        return {"query": query, "count": len(items), "results": items}
+        return {
+            "query": filters.q,
+            "count": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": filters.describe(),
+            "results": items,
+        }
 
     def get_thread(self, thread_key: str) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
